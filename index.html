@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>漢字の庭</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 /* ── Variables ── */
 :root {
@@ -1798,6 +1799,7 @@ a { color: var(--link); text-decoration: none; }
 <nav id="nav">
   <div id="logo" onclick="showView('accueil')">漢</div>
   <div id="app-title" onclick="showView('accueil')">漢字の庭</div>
+  <span id="sync-indicator" title="Sync cloud" style="font-size:13px;color:#B4B2A9;margin-left:4px;cursor:default;user-select:none;">☁</span>
   <div class="nav-tabs">
     <button class="nav-tab" data-view="kanji" onclick="showView('kanji')">漢字</button>
     <button class="nav-tab" data-view="bushu" onclick="showView('bushu')">部首</button>
@@ -1953,20 +1955,6 @@ a { color: var(--link); text-decoration: none; }
       <div class="hint-text">Laissez "Limite de révisions" vide pour ne pas plafonner les révisions en attente.</div>
     </div>
 
-    <div class="settings-section">
-      <div class="settings-section-title">Export / Import</div>
-      <div class="export-import-row">
-        <button class="export-import-btn" onclick="exportData()">
-          <span>⬇</span> Exporter JSON
-          <span style="font-size:12px;color:var(--hint);">Sauvegardez vos données</span>
-        </button>
-        <label class="export-import-btn" style="cursor:pointer;">
-          <span>⬆</span> Importer JSON
-          <span style="font-size:12px;color:var(--hint);">Chargez un fichier de sauvegarde</span>
-          <input type="file" accept=".json" id="import-file" style="display:none;" onchange="importData(event)">
-        </label>
-      </div>
-    </div>
 
     <div class="settings-section">
       <div class="settings-section-title">Statistiques</div>
@@ -1985,6 +1973,15 @@ a { color: var(--link); text-decoration: none; }
         <div style="font-size:13px;font-weight:500;margin-bottom:8px;">Kanji par thème :</div>
         <div id="stats-themes"></div>
       </div>
+    </div>
+
+    <div class="settings-section">
+      <div class="settings-section-title">Synchronisation cloud</div>
+      <div style="font-size:13px;color:var(--muted);">
+        device_id : <code id="device-id-display" style="font-family:monospace;font-size:12px;word-break:break-all;"></code>
+        <button class="btn-icon" onclick="copyDeviceId()" title="Copier l'identifiant" style="margin-left:6px;">⎘</button>
+      </div>
+      <div class="hint-text">Votre progression SRS est synchronisée automatiquement avec Supabase après chaque révision.</div>
     </div>
 
     <div class="settings-section">
@@ -2097,7 +2094,9 @@ const NIVEAUX = [
 const CONFIG = {
   apiKey: "",
   model: "claude-sonnet-4-6",
-  apiUrl: "https://api.anthropic.com/v1/messages"
+  apiUrl: "https://api.anthropic.com/v1/messages",
+  supabaseUrl: "https://qywmxbnpgfwbhkuoeyya.supabase.co",
+  supabaseKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF5d214Ym5wZ2Z3YmhrdW9leXlhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIwOTY5NTYsImV4cCI6MjA5NzY3Mjk1Nn0.h0rkaZIG4IZBllc-uEJeyTwB3m3juo1WOMcwRlAHB9M"
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -2105,6 +2104,107 @@ const CONFIG = {
 // ══════════════════════════════════════════════════════════════
 let JOYO_DATA = []
 let JLPT_DATA = []
+let MOTS_JLPT = []
+let supabase = null
+
+// ══════════════════════════════════════════════════════════════
+// SUPABASE — SYNC CLOUD (couche additionnelle, offline-first)
+// ══════════════════════════════════════════════════════════════
+function getDeviceId() {
+  let id = localStorage.getItem('kanjiNiwa_deviceId')
+  if (!id) {
+    id = 'device_' + Date.now() + '_' + Math.random().toString(36).slice(2)
+    localStorage.setItem('kanjiNiwa_deviceId', id)
+  }
+  return id
+}
+
+function initSupabase() {
+  if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) return
+  supabase = window.supabase.createClient(CONFIG.supabaseUrl, CONFIG.supabaseKey)
+}
+
+function setSyncStatus(status) {
+  const el = document.getElementById('sync-indicator')
+  if (!el) return
+  const icons  = { idle: '☁', syncing: '↻', ok: '✓', error: '!' }
+  const colors = { idle: '#B4B2A9', syncing: '#EF9F27', ok: '#639922', error: '#E24B4A' }
+  el.textContent = icons[status] || '☁'
+  el.style.color = colors[status] || '#B4B2A9'
+}
+
+async function syncSRSToCloud(item_id, item_type, srsData) {
+  if (!supabase) return
+  setSyncStatus('syncing')
+  const { error } = await supabase
+    .from('kanji_progress')
+    .upsert({
+      device_id:       getDeviceId(),
+      item_id,
+      item_type,
+      srs_state:       srsData.srs_state,
+      srs_next_review: srsData.srs_next_review,
+      srs_interval:    srsData.srs_interval,
+      srs_reviews:     srsData.srs_reviews
+    }, { onConflict: 'device_id,item_id,item_type' })
+  if (error) console.error('Sync error:', error)
+  setSyncStatus('ok')
+  setTimeout(() => setSyncStatus('idle'), 1000)
+}
+
+async function loadSRSFromCloud() {
+  if (!supabase) return
+  setSyncStatus('syncing')
+  const deviceId = getDeviceId()
+
+  const { data: progress } = await supabase
+    .from('kanji_progress')
+    .select('*')
+    .eq('device_id', deviceId)
+
+  if (progress) {
+    progress.forEach(row => {
+      if (row.item_type === 'kanji') {
+        const kanji = db.kanji.find(k => k.id === row.item_id)
+        if (kanji) {
+          kanji.srs_state       = row.srs_state
+          kanji.srs_next_review = row.srs_next_review
+          kanji.srs_interval    = row.srs_interval
+          kanji.srs_reviews     = row.srs_reviews
+        }
+      }
+    })
+  }
+
+  const { data: mots } = await supabase
+    .from('mots_jlpt_fiches')
+    .select('*')
+    .eq('device_id', deviceId)
+
+  if (mots) MOTS_JLPT = mots
+
+  setSyncStatus('ok')
+  setTimeout(() => setSyncStatus('idle'), 2000)
+}
+
+async function saveMotFiche(fiche) {
+  if (!supabase) return
+  fiche.device_id = getDeviceId()
+  await supabase
+    .from('mots_jlpt_fiches')
+    .upsert(fiche, { onConflict: 'id' })
+  const idx = MOTS_JLPT.findIndex(m => m.id === fiche.id)
+  if (idx >= 0) MOTS_JLPT[idx] = fiche
+  else MOTS_JLPT.push(fiche)
+}
+
+function copyDeviceId() {
+  const id = getDeviceId()
+  navigator.clipboard.writeText(id).then(() => {
+    const el = document.getElementById('device-id-display')
+    if (el) { const orig = el.textContent; el.textContent = 'Copié !'; setTimeout(() => el.textContent = orig, 1500) }
+  })
+}
 
 // ══════════════════════════════════════════════════════════════
 // PROMPT SYSTÈME IA
@@ -2155,75 +2255,12 @@ Règles pour les phrases :
 - Les hiragana doivent être parfaitement corrects`
 
 // ══════════════════════════════════════════════════════════════
-// BASE DE DONNÉES (état runtime)
+// BASE DE DONNÉES (état runtime — chargé depuis DATA.json au boot)
 // ══════════════════════════════════════════════════════════════
 let db = { radicaux: [], kanji: [], mots: [] }
 
-async function initDB() {
-  if (!localStorage.getItem("kanjiNiwa_v1")) {
-    try {
-      const response = await fetch('./DATA.json')
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      const data = await response.json()
-      localStorage.setItem("kanjiNiwa_v1", JSON.stringify(data))
-    } catch (e) {
-      console.error("Impossible de charger DATA.json :", e)
-      localStorage.setItem("kanjiNiwa_v1", JSON.stringify({ radicaux: [], kanji: [], mots: [] }))
-    }
-  }
-  try {
-    db = JSON.parse(localStorage.getItem("kanjiNiwa_v1"))
-  } catch (e) {
-    console.error('kanjiNiwa_v1 corrompu, réinitialisation :', e)
-    db = { radicaux: [], kanji: [], mots: [] }
-    localStorage.setItem("kanjiNiwa_v1", JSON.stringify(db))
-    alert('Vos données locales étaient corrompues, elles ont été réinitialisées.')
-  }
-  if (!db.radicaux) db.radicaux = []
-  if (!db.kanji)    db.kanji = []
-  if (!db.mots)     db.mots = []
-  migrateDB()
-  saveDB()
-}
-
-function saveDB() {
-  try {
-    localStorage.setItem("kanjiNiwa_v1", JSON.stringify(db))
-  } catch (e) {
-    console.error('saveDB QuotaExceededError :', e)
-    alert('Espace de stockage plein. Exportez vos données en JSON depuis ⚙️ et envisagez de réinitialiser.')
-  }
-}
-
-// ══════════════════════════════════════════════════════════════
-// JLPT VOCAB — Init & helpers
-// ══════════════════════════════════════════════════════════════
-function initJLPT() {
-  if (!localStorage.getItem('kanjiNiwa_motsJLPT')) {
-    localStorage.setItem('kanjiNiwa_motsJLPT', JSON.stringify([]))
-  }
-}
-
-function getMotsJLPT() {
-  try {
-    return JSON.parse(localStorage.getItem('kanjiNiwa_motsJLPT') || '[]')
-  } catch (e) {
-    console.error('kanjiNiwa_motsJLPT corrompu :', e)
-    return []
-  }
-}
-function saveMotsJLPT(mots) {
-  try {
-    localStorage.setItem('kanjiNiwa_motsJLPT', JSON.stringify(mots))
-  } catch (e) {
-    console.error('saveMotsJLPT QuotaExceededError :', e)
-    alert('Espace de stockage plein. Exportez vos données en JSON depuis ⚙️ et envisagez de réinitialiser.')
-  }
-}
-
 function getWordState(jlpt_entry) {
-  const motsJLPT = getMotsJLPT()
-  const mot = motsJLPT.find(m => m.japonais === jlpt_entry.japonais)
+  const mot = MOTS_JLPT.find(m => m.japonais === jlpt_entry.japonais)
   if (!mot) return { state: 'locked', mot: null, jlpt: jlpt_entry }
   return {
     state: mot.srs_state >= 3 ? 'mastered' : 'studying',
@@ -2432,8 +2469,7 @@ function renderJLPTGrid() {
   const search      = (document.getElementById('jlpt-search') ? document.getElementById('jlpt-search').value : '').toLowerCase().trim()
   const levelFilter = document.getElementById('jlpt-level-filter') ? document.getElementById('jlpt-level-filter').value : ''
   const srsFilter   = document.getElementById('jlpt-srs-filter')   ? document.getElementById('jlpt-srs-filter').value   : ''
-  const motsJLPT    = getMotsJLPT()
-  const motsMap     = new Map(motsJLPT.map(m => [m.japonais, m]))
+  const motsMap     = new Map(MOTS_JLPT.map(m => [m.japonais, m]))
 
   let cards = JLPT_DATA
   if (levelFilter) cards = cards.filter(j => j.niveau === levelFilter)
@@ -2613,7 +2649,7 @@ async function generateFromLocked(numero) {
     data.srs_state = 1; data.srs_next_review = null; data.srs_interval = 1; data.srs_reviews = 0
     if (!db.kanji.find(k => k.caractere === j.caractere)) {
       db.kanji.push(data)
-      saveDB()
+      syncSRSToCloud(data.id, 'kanji', data)
     }
     // Unlock animation on the card
     const cardEl = document.getElementById('card-' + j.numero)
@@ -2640,8 +2676,7 @@ function openFicheJLPT(numero) {
 }
 
 function renderFicheJLPT(j) {
-  const motsJLPT   = getMotsJLPT()
-  const mot        = motsJLPT.find(m => m.japonais === j.japonais)
+  const mot        = MOTS_JLPT.find(m => m.japonais === j.japonais)
   const el         = document.getElementById('fiche-jlpt-content')
   const apiDisabled = !getApiKey() ? 'disabled title="Ajoutez votre clé API dans ⚙️"' : ''
   const lc = JLPT_LEVEL_COLORS[j.niveau] || '#888'
@@ -2738,13 +2773,12 @@ async function generateFromLockedJLPT(numero) {
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Génération...' }
   try {
     const data = await generateMotJLPT(j)
-    const motsJLPT = getMotsJLPT()
-    if (!motsJLPT.find(m => m.japonais === j.japonais)) {
+    if (!MOTS_JLPT.find(m => m.japonais === j.japonais)) {
       const composants = (data.composants || []).map(c => {
         const k = db.kanji.find(k => k.caractere === c.c)
         return { c: c.c, id: k ? k.id : null }
       })
-      motsJLPT.push({
+      const fiche = {
         id: 'jlpt_' + j.numero,
         japonais: j.japonais,
         lecture: j.lecture,
@@ -2758,9 +2792,9 @@ async function generateFromLockedJLPT(numero) {
         srs_next_review: null,
         srs_interval: 1,
         srs_reviews: 0,
-        date_ajout: new Date().toISOString()
-      })
-      saveMotsJLPT(motsJLPT)
+        date_ajout: new Date().toISOString().split('T')[0]
+      }
+      await saveMotFiche(fiche)
     }
     renderFicheJLPT(j)
   } catch (err) {
@@ -2920,7 +2954,7 @@ function setSRS(kanjiId, newStateId, btnEl, activeCls) {
     k.srs_interval    = 0
     k.srs_next_review = null
   }
-  saveDB()
+  syncSRSToCloud(kanjiId, 'kanji', k)
   const container = btnEl.closest('.srs-buttons')
   container.querySelectorAll('.srs-btn').forEach(b => {
     b.classList.remove('active-inconnu','active-nouveau','active-orange','active-consolide','active-vert','active-rouge')
@@ -3305,11 +3339,10 @@ function setQuizPoolMode(mode) {
 function getCardsForSessionJLPT() {
   const today    = new Date().toISOString().split('T')[0]
   const newLimit = getDailyNewLimit()
-  const motsJLPT = getMotsJLPT()
-  const reviews  = motsJLPT
+  const reviews  = MOTS_JLPT
     .filter(m => (m.srs_state || 0) >= 1 && (!m.srs_next_review || m.srs_next_review <= today))
     .map(m => ({ ...m, _type: 'jlpt' }))
-  const nouveaux = motsJLPT
+  const nouveaux = MOTS_JLPT
     .filter(m => (m.srs_state || 0) === 0)
     .slice(0, newLimit)
     .map(m => ({ ...m, _type: 'jlpt' }))
@@ -3503,10 +3536,8 @@ function quizVerdict(verdict) {
   if (!card) return
 
   let target = null
-  let jlptArray = null
   if (card._type === 'jlpt') {
-    jlptArray = getMotsJLPT()
-    target = jlptArray.find(m => m.japonais === card.japonais)
+    target = MOTS_JLPT.find(m => m.japonais === card.japonais)
   } else if (card._type === 'kanji') {
     target = db.kanji.find(k => k.id === card.id)
   } else {
@@ -3541,17 +3572,14 @@ function quizVerdict(verdict) {
       }
     }
     target.srs_next_review = computeNextReview(target.srs_interval)
-    if (card._type === 'jlpt' && jlptArray) {
-      saveMotsJLPT(jlptArray)
+    if (card._type === 'jlpt') {
+      syncSRSToCloud(target.id, 'jlpt', target)
+      recordReview()
     } else {
-      saveDB()
-    }
-    if (card._type === 'kanji') {
-      recordReview()
-      const reponseMap = { forgot: 'oublie', hard: 'dur', ok: 'ok', perfect: 'parfait' }
-      recordReviewToHistory(card.id, reponseMap[verdict] || verdict)
-    } else if (card._type === 'jlpt') {
-      recordReview()
+      if (card._type === 'kanji') {
+        syncSRSToCloud(card.id, 'kanji', target)
+        recordReview()
+      }
     }
   }
 
@@ -3585,6 +3613,8 @@ function saveApiKey() {
 }
 
 function renderSettings() {
+  const deviceIdEl = document.getElementById('device-id-display')
+  if (deviceIdEl) deviceIdEl.textContent = getDeviceId()
   const savedKey = localStorage.getItem('kanjiNiwa_apiKey') || ''
   document.getElementById('api-key-input').value = savedKey
   document.getElementById('daily-new-limit-input').value = localStorage.getItem('kanjiNiwa_dailyNewLimit') || '10'
@@ -3648,16 +3678,15 @@ function renderSettings() {
     </div>`
   }).join('')
   // Stats JLPT
-  const motsJLPT = getMotsJLPT()
   const jlptLevels = { N5:520, N4:657, N3:385, N2:3348, N1:2926 }
   const jlptCounts = {}
-  motsJLPT.forEach(m => {
+  MOTS_JLPT.forEach(m => {
     if (jlptCounts[m.niveau_jlpt] !== undefined) jlptCounts[m.niveau_jlpt]++
     else jlptCounts[m.niveau_jlpt] = 1
   })
   document.getElementById('stats-jlpt').innerHTML = `
     <div style="font-size:15px;font-weight:500;margin-bottom:12px;">
-      Mots débloqués : <strong>${motsJLPT.length}</strong> / 7836
+      Mots débloqués : <strong>${MOTS_JLPT.length}</strong> / 7836
     </div>
     ${Object.entries(jlptLevels).map(([niv, total]) => {
       const n = jlptCounts[niv] || 0
@@ -3678,68 +3707,20 @@ function checkResetInput() {
 
 function resetAllData() {
   if (document.getElementById('reset-confirm-input').value !== 'RESET') return
-  localStorage.removeItem('kanjiNiwa_v1')
   localStorage.removeItem('kanjiNiwa_lastReview')
   localStorage.removeItem('kanjiNiwa_streak')
-  localStorage.removeItem('kanjiNiwa_history')
-  localStorage.removeItem('kanjiNiwa_jlpt')
-  localStorage.removeItem('kanjiNiwa_motsJLPT')
   localStorage.removeItem('kanjiNiwa_dailyNewLimit')
   localStorage.removeItem('kanjiNiwa_dailyReviewLimit')
   const resetApiKey = confirm('Supprimer aussi la clé API Claude ?')
   if (resetApiKey) localStorage.removeItem('kanjiNiwa_apiKey')
   db = { radicaux: [], kanji: [], mots: [] }
+  MOTS_JLPT = []
   document.getElementById('reset-confirm-input').value = ''
   document.getElementById('reset-btn').disabled = true
   renderSettings()
-  alert('Données réinitialisées.')
+  alert('Données réinitialisées en mémoire. La progression cloud reste dans Supabase.')
 }
 
-// ── Export / Import ──
-function exportData() {
-  const json = JSON.stringify(db, null, 2)
-  const blob = new Blob([json], { type: 'application/json' })
-  const url  = URL.createObjectURL(blob)
-  const a    = document.createElement('a')
-  const date = new Date().toISOString().slice(0,10).replace(/-/g,'')
-  a.href     = url
-  a.download = `kanji_niwa_backup_${date}.json`
-  a.click()
-  URL.revokeObjectURL(url)
-}
-
-function importData(event) {
-  const file = event.target.files[0]
-  if (!file) return
-  const reader = new FileReader()
-  reader.onload = e => {
-    try {
-      const imported = JSON.parse(e.target.result)
-      if (!imported.kanji && !imported.radicaux && !imported.mots) {
-        alert('Fichier JSON invalide.')
-        return
-      }
-      // Merge par ID, sans doublons
-      const mergeById = (existing, incoming) => {
-        const map = {}
-        existing.forEach(x => { map[x.id] = x })
-        incoming.forEach(x => { if (!map[x.id]) map[x.id] = x })
-        return Object.values(map)
-      }
-      if (imported.radicaux) db.radicaux = mergeById(db.radicaux, imported.radicaux)
-      if (imported.kanji)    db.kanji    = mergeById(db.kanji,    imported.kanji)
-      if (imported.mots)     db.mots     = mergeById(db.mots,     imported.mots)
-      migrateDB()
-      saveDB()
-      renderSettings()
-      alert(`Import réussi. ${db.kanji.length} kanji en base.`)
-    } catch {
-      alert('Erreur lors du parsing du fichier JSON.')
-    }
-  }
-  reader.readAsText(file)
-  event.target.value = ''
-}
 
 // ══════════════════════════════════════════════════════════════
 // MODAL — AJOUT KANJI
@@ -3865,7 +3846,7 @@ function addKanji() {
   }
 
   db.kanji.push(newKanji)
-  saveDB()
+  syncSRSToCloud(newKanji.id, 'kanji', newKanji)
   const _char = newKanji.caractere
   _generatedData = null
   closeModal()
@@ -3931,7 +3912,6 @@ async function regenerateKanjiIA(kanjiId) {
     k.mnemo      = data.mnemo      || k.mnemo
     k.mots       = data.mots       || k.mots
     k.phrases    = data.phrases    || k.phrases
-    saveDB()
     renderFicheKanji(k)
   } catch (err) {
     alert('Erreur IA : ' + err.message)
@@ -3960,37 +3940,22 @@ function calcStreak() {
   return 0
 }
 
-function getHistory() {
-  try { return JSON.parse(localStorage.getItem('kanjiNiwa_history') || '{}') } catch(e) { return {} }
-}
-function saveHistory(h) { localStorage.setItem('kanjiNiwa_history', JSON.stringify(h)) }
-function recordReviewToHistory(kanjiId, reponse) {
-  var today = new Date().toISOString().split('T')[0]
-  var h = getHistory()
-  if (!h[today]) h[today] = []
-  h[today].push({ kanji_id: kanjiId, reponse: reponse })
-  saveHistory(h)
-}
-
 function buildActivitySection() {
-  var h = getHistory(), cells = ''
+  var cells = ''
   for (var i = 0; i < 84; i++) {
     var d = new Date(); d.setDate(d.getDate() - (83 - i))
     var dateStr = d.toISOString().split('T')[0]
-    var n = (h[dateStr] || []).length
-    var col = n === 0 ? '#F2F0EB' : n <= 3 ? '#FAC775' : n <= 8 ? '#EF9F27' : '#C0392B'
-    cells += '<div class="contrib-cell" title="' + dateStr + ': ' + n + '" style="background:' + col + '"></div>'
+    cells += '<div class="contrib-cell" title="' + dateStr + '" style="background:#F2F0EB"></div>'
   }
   return '<div class="pokedex-section"><div class="pokedex-title">Activité</div><div class="contrib-grid">' + cells + '</div></div>'
 }
 function buildWorkloadSection() {
   var bars = [], maxCount = 1
-  var motsJLPT = getMotsJLPT()
   for (var i = 0; i <= 14; i++) {
     var d = new Date(); d.setDate(d.getDate() + i)
     var dateStr = d.toISOString().split('T')[0]
     var countKanji = db.kanji.filter(function(k) { return k.srs_next_review === dateStr }).length
-    var countJLPT  = motsJLPT.filter(function(m) { return m.srs_next_review === dateStr }).length
+    var countJLPT  = MOTS_JLPT.filter(function(m) { return m.srs_next_review === dateStr }).length
     var count = countKanji + countJLPT
     bars.push({ label: i === 0 ? 'Auj.' : i === 1 ? 'Dem.' : 'J+' + i, count: count })
     if (count > maxCount) maxCount = count
@@ -4165,21 +4130,38 @@ function renderAccueil() {
     </div>`
 
   try {
-    const [joyo, jlpt] = await Promise.all([
+    const [kanjiData, joyo, jlpt] = await Promise.all([
+      fetch('./DATA.json').then(r => { if (!r.ok) throw new Error('DATA.json introuvable'); return r.json() }),
       fetch('./joyo_data.json').then(r => { if (!r.ok) throw new Error('joyo_data.json introuvable'); return r.json() }),
       fetch('./jlpt_vocab.json').then(r => { if (!r.ok) throw new Error('jlpt_vocab.json introuvable'); return r.json() })
     ])
+    db = kanjiData
+    if (!db.radicaux) db.radicaux = []
+    if (!db.kanji)    db.kanji    = []
+    if (!db.mots)     db.mots     = []
+    migrateDB()
     JOYO_DATA = joyo
     JLPT_DATA = jlpt
+    MOTS_JLPT = []
   } catch (e) {
-    console.error('Erreur chargement données externes :', e)
+    console.error('Erreur chargement données statiques :', e)
     document.body.innerHTML = ERR_HTML
     return
   }
 
-  await initDB()
-  initJLPT()
+  initSupabase()
   CONFIG.apiKey = localStorage.getItem('kanjiNiwa_apiKey') || ''
+
+  if (!supabase) {
+    const warn = document.createElement('div')
+    warn.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#EF9F27;color:#fff;text-align:center;padding:10px 16px;font-size:13px;z-index:9999;'
+    warn.textContent = 'Configurez Supabase dans CONFIG pour sauvegarder votre progression. Sans cela, vos révisions ne seront pas sauvegardées.'
+    document.body.prepend(warn)
+    setTimeout(() => warn.remove(), 6000)
+  } else {
+    await loadSRSFromCloud()
+  }
+
   if (loader) loader.remove()
   showView('accueil')
 })()
