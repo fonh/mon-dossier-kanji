@@ -973,6 +973,22 @@ a { color: var(--link); text-decoration: none; }
   color: var(--muted);
   margin-top: 16px;
 }
+.anki-counters {
+  display: flex;
+  justify-content: center;
+  gap: 24px;
+  margin-bottom: 20px;
+}
+.anki-counter {
+  font-size: 22px;
+  font-weight: 700;
+  min-width: 28px;
+  text-align: center;
+  line-height: 1;
+}
+.anki-new      { color: #4A90D9; }
+.anki-learning { color: #E24B4A; }
+.anki-review   { color: #639922; }
 
 .quiz-empty {
   text-align: center;
@@ -1799,8 +1815,7 @@ a { color: var(--link); text-decoration: none; }
 <nav id="nav">
   <div id="logo" onclick="showView('accueil')">漢</div>
   <div id="app-title" onclick="showView('accueil')">漢字の庭</div>
-  <span id="sync-indicator" title="Sync cloud" style="font-size:13px;color:#B4B2A9;margin-left:4px;cursor:default;user-select:none;">☁</span>
-  <div class="nav-tabs">
+<div class="nav-tabs">
     <button class="nav-tab" data-view="kanji" onclick="showView('kanji')">漢字</button>
     <button class="nav-tab" data-view="bushu" onclick="showView('bushu')">部首</button>
     <button class="nav-tab" data-view="goi" onclick="showView('goi')">語彙</button>
@@ -1984,17 +1999,6 @@ a { color: var(--link); text-decoration: none; }
       <div class="hint-text">Votre progression SRS est synchronisée automatiquement avec Supabase après chaque révision.</div>
     </div>
 
-    <div class="settings-section">
-      <div class="settings-section-title">Réinitialisation</div>
-      <div class="reset-section">
-        <p style="font-size:13px;color:var(--muted);margin-bottom:10px;">Cette action supprimera toutes vos données de façon irréversible.</p>
-        <div class="reset-confirm-row">
-          <input type="text" class="reset-input modal-input" id="reset-confirm-input" placeholder='Tapez "RESET"' oninput="checkResetInput()">
-          <button class="btn-danger" id="reset-btn" disabled onclick="resetAllData()">Réinitialiser</button>
-        </div>
-      </div>
-    </div>
-
   </div>
 
 </div>
@@ -2155,10 +2159,6 @@ async function loadSRSFromCloud() {
     .eq('device_id', getDeviceId())
   if (error || !data) return
 
-  let changed     = false
-  let motsJLPT    = null
-  let jlptChanged = false
-
   data.forEach(row => {
     if (row.item_type === 'kanji') {
       const kanji = db.kanji.find(k => k.id === row.item_id)
@@ -2167,28 +2167,19 @@ async function loadSRSFromCloud() {
         kanji.srs_next_review = row.srs_next_review
         kanji.srs_interval    = row.srs_interval
         kanji.srs_reviews     = row.srs_reviews
-        changed = true
       }
     } else if (row.item_type === 'jlpt') {
-      if (!motsJLPT) motsJLPT = getMotsJLPT()
-      const mot = motsJLPT.find(m => m.id === row.item_id)
+      const mot = MOTS_JLPT.find(m => m.id === row.item_id)
       if (mot) {
         mot.srs_state       = row.srs_state
         mot.srs_next_review = row.srs_next_review
         mot.srs_interval    = row.srs_interval
         mot.srs_reviews     = row.srs_reviews
-        jlptChanged = true
       }
     }
   })
 
-  if (changed)                 saveDB()
-  if (jlptChanged && motsJLPT) saveMotsJLPT(motsJLPT)
-  if (changed || jlptChanged) {
-    console.log('SRS chargé depuis Supabase :', data.length, 'entrées')
-    setSyncStatus('ok')
-    setTimeout(() => setSyncStatus('idle'), 3000)
-  }
+  if (data.length > 0) console.log('SRS chargé depuis Supabase :', data.length, 'entrées')
 }
 
 async function pushAllSRSToCloud() {
@@ -2204,7 +2195,7 @@ async function pushAllSRSToCloud() {
       srs_interval: k.srs_interval, srs_reviews: k.srs_reviews
     })
   })
-  getMotsJLPT().forEach(m => {
+  MOTS_JLPT.forEach(m => {
     if (m.srs_state > 0) rows.push({
       device_id: deviceId, item_id: m.id, item_type: 'jlpt',
       srs_state: m.srs_state, srs_next_review: m.srs_next_review,
@@ -3393,50 +3384,52 @@ function getDailyReviewLimit() {
 
 function getCardsForSession() {
   if (quizPoolMode === 'jlpt') return getCardsForSessionJLPT()
-  const today       = new Date().toISOString().split('T')[0]
-  const newLimit    = getDailyNewLimit()
-  const reviewLimit = getDailyReviewLimit()
+  const today    = new Date().toISOString().split('T')[0]
+  const newLimit = getDailyNewLimit()
 
-  const kanjiReviews = db.kanji
-    .filter(k => (k.srs_state || 0) >= 1 && (!k.srs_next_review || k.srs_next_review <= today))
-    .map(k => ({ ...k, _type: 'kanji' }))
+  // Vert — révisions dues (srs_state >= 3, intervalle échu)
+  const reviews = db.kanji
+    .filter(k => (k.srs_state || 0) >= 3 && k.srs_next_review && k.srs_next_review <= today)
+    .map(k => ({ ...k, _type: 'kanji', _category: 'review' }))
 
-  const allMots      = getAllMots()
-  const motReviews   = allMots
-    .filter(m => (m.srs_state || 0) >= 1 && (!m.srs_next_review || m.srs_next_review <= today))
-    .map(m => ({ ...m, _type: 'mot' }))
+  // Rouge — en cours d'apprentissage (srs_state 1 ou 2)
+  const learning = db.kanji
+    .filter(k => (k.srs_state || 0) === 1 || (k.srs_state || 0) === 2)
+    .map(k => ({ ...k, _type: 'kanji', _category: 'learning' }))
 
-  const reviews = [...kanjiReviews, ...motReviews]
-    .slice(0, reviewLimit === Infinity ? undefined : reviewLimit)
-
-  const kanjiNew = db.kanji
+  // Bleu — nouvelles cartes (srs_state 0), limitées au dailyNewLimit
+  const newCards = db.kanji
     .filter(k => (k.srs_state || 0) === 0)
-    .map(k => ({ ...k, _type: 'kanji' }))
+    .slice(0, newLimit)
+    .map(k => ({ ...k, _type: 'kanji', _category: 'new' }))
 
-  const motNew = allMots
-    .filter(m => (m.srs_state || 0) === 0)
-    .map(m => ({ ...m, _type: 'mot' }))
+  return [...reviews, ...learning, ...newCards]
+}
 
-  // Interleave kanji and mots nouveaux for variety
-  const nouveaux = []
-  const maxLen = Math.max(kanjiNew.length, motNew.length)
-  for (let i = 0; i < maxLen && nouveaux.length < newLimit; i++) {
-    if (i < kanjiNew.length) nouveaux.push(kanjiNew[i])
-    if (nouveaux.length < newLimit && i < motNew.length) nouveaux.push(motNew[i])
+function getSessionCounts() {
+  const remaining = quizSession.slice(quizIndex)
+  return {
+    bleu:  remaining.filter(c => c._category === 'new').length,
+    rouge: remaining.filter(c => c._category === 'learning').length,
+    vert:  remaining.filter(c => c._category === 'review').length
   }
-
-  return [...reviews, ...nouveaux]
 }
 
 function renderQuiz() {
   const area = document.getElementById('quiz-area')
 
   if (quizSession.length === 0) {
+    quizPoolMode = 'kanji'
     quizSession = getCardsForSession()
     quizIndex = 0
     quizRevealed = false
     quizTodayCount = 0
   }
+
+  const toggleKanji = document.getElementById('quiz-pool-kanji')
+  const toggleJlpt  = document.getElementById('quiz-pool-jlpt')
+  if (toggleKanji) toggleKanji.classList.toggle('active', quizPoolMode === 'kanji')
+  if (toggleJlpt)  toggleJlpt.classList.toggle('active',  quizPoolMode === 'jlpt')
 
   if (quizSession.length === 0) {
     area.innerHTML = `<div class="quiz-empty" style="text-align:center;padding:2rem 1rem;">
@@ -3483,7 +3476,7 @@ function renderQuizKanjiCard(area, k, total, dotsHtml) {
 
   area.innerHTML = `
     <div class="quiz-card-container">
-      <div class="quiz-counter">Carte ${quizIndex+1}/${total}</div>
+      <div class="anki-counters">${(() => { const c = getSessionCounts(); return `<span class="anki-counter anki-new">${c.bleu}</span><span class="anki-counter anki-learning">${c.rouge}</span><span class="anki-counter anki-review">${c.vert}</span>` })()}</div>
       <div class="quiz-progress-bar">${dotsHtml}</div>
       <div class="quiz-card card-flip">
         <div style="position:absolute;top:10px;right:12px;font-size:11px;color:var(--muted);font-weight:500;letter-spacing:0.03em;opacity:0.7;">漢字</div>
@@ -3511,7 +3504,7 @@ function renderQuizMotCard(area, m, total, dotsHtml) {
 
   area.innerHTML = `
     <div class="quiz-card-container">
-      <div class="quiz-counter">Carte ${quizIndex+1}/${total}</div>
+      <div class="anki-counters">${(() => { const c = getSessionCounts(); return `<span class="anki-counter anki-new">${c.bleu}</span><span class="anki-counter anki-learning">${c.rouge}</span><span class="anki-counter anki-review">${c.vert}</span>` })()}</div>
       <div class="quiz-progress-bar">${dotsHtml}</div>
       <div class="quiz-card card-flip">
         <div style="position:absolute;top:10px;right:12px;font-size:11px;color:var(--muted);font-weight:500;letter-spacing:0.03em;opacity:0.7;">語彙</div>
@@ -3540,7 +3533,7 @@ function renderQuizJLPTCard(area, m, total, dotsHtml) {
 
   area.innerHTML = `
     <div class="quiz-card-container">
-      <div class="quiz-counter">Carte ${quizIndex+1}/${total}</div>
+      <div class="anki-counters">${(() => { const c = getSessionCounts(); return `<span class="anki-counter anki-new">${c.bleu}</span><span class="anki-counter anki-learning">${c.rouge}</span><span class="anki-counter anki-review">${c.vert}</span>` })()}</div>
       <div class="quiz-progress-bar">${dotsHtml}</div>
       <div class="quiz-card card-flip">
         <div style="position:absolute;top:10px;right:12px;font-size:11px;color:${lc};font-weight:700;opacity:0.9;">${m.niveau_jlpt}</div>
@@ -3726,26 +3719,6 @@ function renderSettings() {
   `
 }
 
-function checkResetInput() {
-  const val = document.getElementById('reset-confirm-input').value
-  document.getElementById('reset-btn').disabled = val !== 'RESET'
-}
-
-function resetAllData() {
-  if (document.getElementById('reset-confirm-input').value !== 'RESET') return
-  localStorage.removeItem('kanjiNiwa_lastReview')
-  localStorage.removeItem('kanjiNiwa_streak')
-  localStorage.removeItem('kanjiNiwa_dailyNewLimit')
-  localStorage.removeItem('kanjiNiwa_dailyReviewLimit')
-  const resetApiKey = confirm('Supprimer aussi la clé API Claude ?')
-  if (resetApiKey) localStorage.removeItem('kanjiNiwa_apiKey')
-  db = { radicaux: [], kanji: [], mots: [] }
-  MOTS_JLPT = []
-  document.getElementById('reset-confirm-input').value = ''
-  document.getElementById('reset-btn').disabled = true
-  renderSettings()
-  alert('Données réinitialisées en mémoire. La progression cloud reste dans Supabase.')
-}
 
 
 // ══════════════════════════════════════════════════════════════
@@ -4031,17 +4004,18 @@ function renderAccueil() {
   var niveauIdx = NIVEAUX.indexOf(niveau)
   var next      = niveauIdx < NIVEAUX.length - 1 ? NIVEAUX[niveauIdx + 1] : null
   var streak    = calcStreak()
-  var newLimit     = getDailyNewLimit()
-  var kanjiDue     = db.kanji.filter(function(k) {
-    return (k.srs_state || 0) >= 1 && (!k.srs_next_review || k.srs_next_review <= today)
+  var newLimit    = getDailyNewLimit()
+  // Vert : révisions dues (srs >= 3, intervalle échu)
+  var countReview = db.kanji.filter(function(k) {
+    return (k.srs_state || 0) >= 3 && k.srs_next_review && k.srs_next_review <= today
   }).length
-  var motsDue      = getAllMots().filter(function(m) {
-    return (m.srs_state || 0) >= 1 && (!m.srs_next_review || m.srs_next_review <= today)
+  // Rouge : en cours (srs 1 ou 2) — toujours dues
+  var countLearning = db.kanji.filter(function(k) {
+    var s = k.srs_state || 0; return s === 1 || s === 2
   }).length
-  var countReview  = kanjiDue + motsDue
-  var kanjiNew     = db.kanji.filter(function(k) { return (k.srs_state || 0) === 0 }).length
-  var motsNew      = getAllMots().filter(function(m) { return (m.srs_state || 0) === 0 }).length
-  var countNew     = Math.min(newLimit, kanjiNew + motsNew)
+  // Bleu : nouvelles, limitées
+  var countNew    = Math.min(newLimit, db.kanji.filter(function(k) { return (k.srs_state || 0) === 0 }).length)
+  var countTotal  = countReview + countLearning + countNew
 
 
   // ── Section 1 : Identité du dresseur ──
@@ -4077,10 +4051,14 @@ function renderAccueil() {
     streakHtml = '<div class="today-main-text" style="color:var(--muted)"><svg class="pokeball-spin" width="18" height="18" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="10" cy="10" r="8.5" fill="none" stroke="#1A1A18" stroke-width="1.5"/><path d="M1.5 10 A8.5 8.5 0 0 1 18.5 10" fill="#C0392B"/><path d="M1.5 10 A8.5 8.5 0 0 0 18.5 10" fill="white"/><line x1="1.5" y1="10" x2="18.5" y2="10" stroke="#1A1A18" stroke-width="1.5"/><circle cx="10" cy="10" r="2.5" fill="white" stroke="#1A1A18" stroke-width="1.5"/><circle cx="10" cy="10" r="1" fill="#C0392B"/></svg> ' + streak + ' jour' + (streak > 1 ? 's' : '') + '</div>'
   }
   var reviewHtml
-  if (countReview === 0 && countNew === 0) {
+  if (countTotal === 0) {
     reviewHtml = '<div class="today-main-text" style="color:#1D9E75"><svg width="16" height="16" viewBox="0 0 16 16" style="display:inline;vertical-align:middle" fill="#1D9E75" xmlns="http://www.w3.org/2000/svg"><path d="M8 0L9.6 6.4L16 8L9.6 9.6L8 16L6.4 9.6L0 8L6.4 6.4Z"/></svg> Tout à jour !</div>'
   } else {
-    reviewHtml = '<div class="today-main-text"><svg width="16" height="16" viewBox="0 0 16 16" style="display:inline;vertical-align:middle" fill="none" stroke="currentColor" stroke-width="1.5" xmlns="http://www.w3.org/2000/svg"><rect x="2" y="2" width="12" height="12" rx="1.5"/><line x1="8" y1="2" x2="8" y2="14"/><line x1="4" y1="6" x2="8" y2="6"/><line x1="4" y1="9" x2="8" y2="9"/></svg> <strong>' + countNew + '</strong> nouveaux · <strong>' + countReview + '</strong> à réviser</div>'
+    reviewHtml = '<div class="today-main-text" style="display:flex;align-items:center;gap:14px;">'
+      + (countNew      ? '<span style="color:#4A90D9;font-weight:700;font-size:18px;">' + countNew      + '</span>' : '')
+      + (countLearning ? '<span style="color:#E24B4A;font-weight:700;font-size:18px;">' + countLearning + '</span>' : '')
+      + (countReview   ? '<span style="color:#639922;font-weight:700;font-size:18px;">' + countReview   + '</span>' : '')
+      + '</div>'
       + '<button class="btn-start-review" onclick="showView(\'fukushuu\')">Commencer →</button>'
   }
   var s2 = '<div class="today-row">'
