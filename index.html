@@ -2403,7 +2403,7 @@ function showView(viewName) {
   if (viewName === 'kanji')     { if (kanjiViewMode === 'jlpt') renderJLPTGrid(); else { renderKanjiGrid(); populateRadicalFilter() } }
   if (viewName === 'bushu')     { renderBushu(); renderD3Graph() }
   if (viewName === 'goi')       { renderVocab(); populateVocabKanjiFilter() }
-  if (viewName === 'fukushuu')  renderQuiz()
+  if (viewName === 'fukushuu')  { quizPoolMode = 'kanji'; quizSession = []; renderQuiz() }
   if (viewName === 'settings')  renderSettings()
 }
 
@@ -3418,7 +3418,6 @@ function renderQuiz() {
   const area = document.getElementById('quiz-area')
 
   if (quizSession.length === 0) {
-    quizPoolMode = 'kanji'
     quizSession = getCardsForSession()
     quizIndex = 0
     quizRevealed = false
