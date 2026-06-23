@@ -3346,10 +3346,12 @@ let quizPoolMode = 'kanji'
 
 function setQuizPoolMode(mode) {
   quizPoolMode = mode
-  document.getElementById('quiz-pool-kanji').classList.toggle('active', mode === 'kanji')
-  document.getElementById('quiz-pool-jlpt').classList.toggle('active', mode === 'jlpt')
-  quizSession = []
-  quizIndex = 0
+  // Construire la session AVANT renderQuiz pour qu'elle ne voie pas une session vide
+  // et ne réinitialise pas quizPoolMode à 'kanji'
+  quizSession   = getCardsForSession()
+  quizIndex     = 0
+  quizRevealed  = false
+  quizTodayCount = 0
   renderQuiz()
 }
 
@@ -3384,23 +3386,20 @@ function getDailyReviewLimit() {
 
 function getCardsForSession() {
   if (quizPoolMode === 'jlpt') return getCardsForSessionJLPT()
-  const today    = new Date().toISOString().split('T')[0]
-  const newLimit = getDailyNewLimit()
+  const today      = new Date().toISOString().split('T')[0]
+  const dailyLimit = getDailyNewLimit()
 
-  // Vert — révisions dues (srs_state >= 3, intervalle échu)
   const reviews = db.kanji
-    .filter(k => (k.srs_state || 0) >= 3 && k.srs_next_review && k.srs_next_review <= today)
+    .filter(k => k.srs_state >= 3 && k.srs_next_review <= today)
     .map(k => ({ ...k, _type: 'kanji', _category: 'review' }))
 
-  // Rouge — en cours d'apprentissage (srs_state 1 ou 2)
   const learning = db.kanji
-    .filter(k => (k.srs_state || 0) === 1 || (k.srs_state || 0) === 2)
+    .filter(k => k.srs_state === 1 || k.srs_state === 2)
     .map(k => ({ ...k, _type: 'kanji', _category: 'learning' }))
 
-  // Bleu — nouvelles cartes (srs_state 0), limitées au dailyNewLimit
   const newCards = db.kanji
-    .filter(k => (k.srs_state || 0) === 0)
-    .slice(0, newLimit)
+    .filter(k => k.srs_state === 0)
+    .slice(0, dailyLimit)
     .map(k => ({ ...k, _type: 'kanji', _category: 'new' }))
 
   return [...reviews, ...learning, ...newCards]
@@ -4144,6 +4143,13 @@ function renderAccueil() {
     if (!db.kanji)    db.kanji    = []
     if (!db.mots)     db.mots     = []
     migrateDB()
+    // Seul Supabase fait foi — on part de zéro, loadSRSFromCloud() applique la progression
+    db.kanji.forEach(k => {
+      k.srs_state       = 0
+      k.srs_next_review = null
+      k.srs_interval    = 0
+      k.srs_reviews     = 0
+    })
     JOYO_DATA = joyo
     JLPT_DATA = jlpt
     MOTS_JLPT = []
