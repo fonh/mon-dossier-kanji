@@ -2105,8 +2105,6 @@ const CONFIG = {
 let JOYO_DATA = []
 let JLPT_DATA = []
 let MOTS_JLPT = []
-let supabase = null
-
 // ══════════════════════════════════════════════════════════════
 // SUPABASE — SYNC CLOUD (couche additionnelle, offline-first)
 // ══════════════════════════════════════════════════════════════
@@ -2121,7 +2119,7 @@ function getDeviceId() {
 
 function initSupabase() {
   if (!CONFIG.supabaseUrl || !CONFIG.supabaseKey) return
-  supabase = window.supabase.createClient(CONFIG.supabaseUrl, CONFIG.supabaseKey)
+  window._supabaseClient = window.supabase.createClient(CONFIG.supabaseUrl, CONFIG.supabaseKey)
 }
 
 function setSyncStatus(status) {
@@ -2134,9 +2132,8 @@ function setSyncStatus(status) {
 }
 
 async function syncSRSToCloud(item_id, item_type, srsData) {
-  if (!supabase) return
-  setSyncStatus('syncing')
-  const { error } = await supabase
+  if (!window._supabaseClient) return
+  const { error } = await window._supabaseClient
     .from('kanji_progress')
     .upsert({
       device_id:       getDeviceId(),
@@ -2148,54 +2145,83 @@ async function syncSRSToCloud(item_id, item_type, srsData) {
       srs_reviews:     srsData.srs_reviews
     }, { onConflict: 'device_id,item_id,item_type' })
   if (error) console.error('Sync error:', error)
-  setSyncStatus('ok')
-  setTimeout(() => setSyncStatus('idle'), 1000)
 }
 
 async function loadSRSFromCloud() {
-  if (!supabase) return
-  setSyncStatus('syncing')
-  const deviceId = getDeviceId()
-
-  const { data: progress } = await supabase
+  if (!window._supabaseClient) return
+  const { data, error } = await window._supabaseClient
     .from('kanji_progress')
     .select('*')
-    .eq('device_id', deviceId)
+    .eq('device_id', getDeviceId())
+  if (error || !data) return
 
-  if (progress) {
-    progress.forEach(row => {
-      if (row.item_type === 'kanji') {
-        const kanji = db.kanji.find(k => k.id === row.item_id)
-        if (kanji) {
-          kanji.srs_state       = row.srs_state
-          kanji.srs_next_review = row.srs_next_review
-          kanji.srs_interval    = row.srs_interval
-          kanji.srs_reviews     = row.srs_reviews
-        }
+  let changed     = false
+  let motsJLPT    = null
+  let jlptChanged = false
+
+  data.forEach(row => {
+    if (row.item_type === 'kanji') {
+      const kanji = db.kanji.find(k => k.id === row.item_id)
+      if (kanji) {
+        kanji.srs_state       = row.srs_state
+        kanji.srs_next_review = row.srs_next_review
+        kanji.srs_interval    = row.srs_interval
+        kanji.srs_reviews     = row.srs_reviews
+        changed = true
       }
-    })
+    } else if (row.item_type === 'jlpt') {
+      if (!motsJLPT) motsJLPT = getMotsJLPT()
+      const mot = motsJLPT.find(m => m.id === row.item_id)
+      if (mot) {
+        mot.srs_state       = row.srs_state
+        mot.srs_next_review = row.srs_next_review
+        mot.srs_interval    = row.srs_interval
+        mot.srs_reviews     = row.srs_reviews
+        jlptChanged = true
+      }
+    }
+  })
+
+  if (changed)                 saveDB()
+  if (jlptChanged && motsJLPT) saveMotsJLPT(motsJLPT)
+  if (changed || jlptChanged) {
+    console.log('SRS chargé depuis Supabase :', data.length, 'entrées')
+    setSyncStatus('ok')
+    setTimeout(() => setSyncStatus('idle'), 3000)
   }
-
-  const { data: mots } = await supabase
-    .from('mots_jlpt_fiches')
-    .select('*')
-    .eq('device_id', deviceId)
-
-  if (mots) MOTS_JLPT = mots
-
-  setSyncStatus('ok')
-  setTimeout(() => setSyncStatus('idle'), 2000)
 }
 
-async function saveMotFiche(fiche) {
-  if (!supabase) return
-  fiche.device_id = getDeviceId()
-  await supabase
-    .from('mots_jlpt_fiches')
-    .upsert(fiche, { onConflict: 'id' })
-  const idx = MOTS_JLPT.findIndex(m => m.id === fiche.id)
-  if (idx >= 0) MOTS_JLPT[idx] = fiche
-  else MOTS_JLPT.push(fiche)
+async function pushAllSRSToCloud() {
+  if (!window._supabaseClient) return
+  setSyncStatus('syncing')
+  const rows     = []
+  const deviceId = getDeviceId()
+
+  db.kanji.forEach(k => {
+    if (k.srs_state > 0) rows.push({
+      device_id: deviceId, item_id: k.id, item_type: 'kanji',
+      srs_state: k.srs_state, srs_next_review: k.srs_next_review,
+      srs_interval: k.srs_interval, srs_reviews: k.srs_reviews
+    })
+  })
+  getMotsJLPT().forEach(m => {
+    if (m.srs_state > 0) rows.push({
+      device_id: deviceId, item_id: m.id, item_type: 'jlpt',
+      srs_state: m.srs_state, srs_next_review: m.srs_next_review,
+      srs_interval: m.srs_interval, srs_reviews: m.srs_reviews
+    })
+  })
+
+  if (rows.length === 0) { setSyncStatus('idle'); return }
+
+  for (let i = 0; i < rows.length; i += 100) {
+    const { error } = await window._supabaseClient
+      .from('kanji_progress')
+      .upsert(rows.slice(i, i + 100), { onConflict: 'device_id,item_id,item_type' })
+    if (error) { console.error('Push error:', error); setSyncStatus('error'); return }
+  }
+  setSyncStatus('ok')
+  setTimeout(() => setSyncStatus('idle'), 3000)
 }
 
 function copyDeviceId() {
@@ -4152,15 +4178,7 @@ function renderAccueil() {
   initSupabase()
   CONFIG.apiKey = localStorage.getItem('kanjiNiwa_apiKey') || ''
 
-  if (!supabase) {
-    const warn = document.createElement('div')
-    warn.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#EF9F27;color:#fff;text-align:center;padding:10px 16px;font-size:13px;z-index:9999;'
-    warn.textContent = 'Configurez Supabase dans CONFIG pour sauvegarder votre progression. Sans cela, vos révisions ne seront pas sauvegardées.'
-    document.body.prepend(warn)
-    setTimeout(() => warn.remove(), 6000)
-  } else {
-    await loadSRSFromCloud()
-  }
+  await loadSRSFromCloud()
 
   if (loader) loader.remove()
   showView('accueil')
