@@ -2137,18 +2137,27 @@ function setSyncStatus(status) {
 
 async function syncSRSToCloud(item_id, item_type, srsData) {
   if (!window._supabaseClient) return
-  const { error } = await window._supabaseClient
-    .from('kanji_progress')
-    .upsert({
-      device_id:       getDeviceId(),
-      item_id,
-      item_type,
-      srs_state:       srsData.srs_state,
-      srs_next_review: srsData.srs_next_review,
-      srs_interval:    srsData.srs_interval,
-      srs_reviews:     srsData.srs_reviews
-    }, { onConflict: 'device_id,item_id,item_type' })
-  if (error) console.error('Sync error:', error)
+  try {
+    setSyncStatus('syncing')
+    const { error } = await window._supabaseClient
+      .from('kanji_progress')
+      .upsert({
+        device_id:       getDeviceId(),
+        item_id,
+        item_type,
+        srs_state:       srsData.srs_state,
+        srs_next_review: srsData.srs_next_review || null,
+        srs_interval:    srsData.srs_interval    || 0,
+        srs_reviews:     srsData.srs_reviews     || 0
+      }, { onConflict: 'device_id,item_id,item_type' })
+    if (error) throw error
+    setSyncStatus('ok')
+    setTimeout(() => setSyncStatus('idle'), 1500)
+  } catch (err) {
+    console.error('syncSRSToCloud error:', err)
+    setSyncStatus('error')
+    setTimeout(() => setSyncStatus('idle'), 3000)
+  }
 }
 
 async function loadSRSFromCloud() {
@@ -2157,7 +2166,8 @@ async function loadSRSFromCloud() {
     .from('kanji_progress')
     .select('*')
     .eq('device_id', getDeviceId())
-  if (error || !data) return
+  if (error) throw error
+  if (!data) return
 
   data.forEach(row => {
     if (row.item_type === 'kanji') {
@@ -2176,10 +2186,29 @@ async function loadSRSFromCloud() {
         mot.srs_interval    = row.srs_interval
         mot.srs_reviews     = row.srs_reviews
       }
+    } else if (row.item_type === 'mot') {
+      const [kanjiId, motIdxStr] = row.item_id.split(':')
+      const motIdx = parseInt(motIdxStr, 10)
+      const pk = db.kanji.find(k => k.id === kanjiId)
+      if (pk && pk.mots && pk.mots[motIdx]) {
+        const m = pk.mots[motIdx]
+        m.srs_state       = row.srs_state
+        m.srs_next_review = row.srs_next_review
+        m.srs_interval    = row.srs_interval
+        m.srs_reviews     = row.srs_reviews
+      }
     }
   })
 
-  if (data.length > 0) console.log('SRS chargé depuis Supabase :', data.length, 'entrées')
+  const reviewDates = [...new Set(
+    data
+      .filter(r => r.srs_reviews > 0)
+      .map(r => r.updated_at?.split('T')[0])
+      .filter(Boolean)
+  )].sort().reverse()
+  window.STREAK = calcStreakFromDates(reviewDates)
+
+  console.log('[Supabase] chargé:', data.length, 'entrées, streak:', window.STREAK)
 }
 
 async function pushAllSRSToCloud() {
@@ -3589,14 +3618,16 @@ function quizVerdict(verdict) {
       }
     }
     target.srs_next_review = computeNextReview(target.srs_interval)
+    console.log('[SRS]', card.id || card._kanjiId, '→', target.srs_state, 'next:', target.srs_next_review)
     if (card._type === 'jlpt') {
       syncSRSToCloud(target.id, 'jlpt', target)
       recordReview()
+    } else if (card._type === 'kanji') {
+      syncSRSToCloud(card.id, 'kanji', target)
+      recordReview()
     } else {
-      if (card._type === 'kanji') {
-        syncSRSToCloud(card.id, 'kanji', target)
-        recordReview()
-      }
+      syncSRSToCloud(card._kanjiId + ':' + card._motIdx, 'mot', target)
+      recordReview()
     }
   }
 
@@ -3929,12 +3960,33 @@ function calcNiveau(n) {
 }
 
 function calcStreak() {
+  if (window.STREAK !== undefined) return window.STREAK
   var today     = new Date().toISOString().split('T')[0]
   var yesterday = new Date(Date.now() - 864e5).toISOString().split('T')[0]
   var last      = localStorage.getItem('kanjiNiwa_lastReview')
   var streak    = parseInt(localStorage.getItem('kanjiNiwa_streak') || '0', 10)
   if (last === today || last === yesterday) return streak
   return 0
+}
+
+function calcStreakFromDates(sortedDates) {
+  if (!sortedDates || !sortedDates.length) return 0
+  var today     = new Date().toISOString().split('T')[0]
+  var yesterday = new Date(Date.now() - 864e5).toISOString().split('T')[0]
+  if (sortedDates[0] !== today && sortedDates[0] !== yesterday) return 0
+  var streak  = 0
+  var current = sortedDates[0]
+  for (var i = 0; i < sortedDates.length; i++) {
+    if (sortedDates[i] === current) {
+      streak++
+      var d = new Date(current)
+      d.setDate(d.getDate() - 1)
+      current = d.toISOString().split('T')[0]
+    } else {
+      break
+    }
+  }
+  return streak
 }
 
 function buildActivitySection() {
@@ -4161,7 +4213,11 @@ function renderAccueil() {
   initSupabase()
   CONFIG.apiKey = localStorage.getItem('kanjiNiwa_apiKey') || ''
 
-  await loadSRSFromCloud()
+  try {
+    await loadSRSFromCloud()
+  } catch (err) {
+    console.error('Impossible de charger depuis Supabase:', err)
+  }
 
   if (loader) loader.remove()
   showView('accueil')
