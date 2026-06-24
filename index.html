@@ -2432,7 +2432,16 @@ function showView(viewName) {
   if (viewName === 'kanji')     { if (kanjiViewMode === 'jlpt') renderJLPTGrid(); else { renderKanjiGrid(); populateRadicalFilter() } }
   if (viewName === 'bushu')     { renderBushu(); renderD3Graph() }
   if (viewName === 'goi')       { renderVocab(); populateVocabKanjiFilter() }
-  if (viewName === 'fukushuu')  { quizPoolMode = 'kanji'; quizSession = []; renderQuiz() }
+  if (viewName === 'fukushuu')  {
+    quizPoolMode = 'kanji'
+    const today = new Date().toISOString().split('T')[0]
+    if (!window.SESSION || window.SESSION._date !== today) {
+      quizTodayCount  = 0
+      quizRevealed    = false
+      buildSession()
+    }
+    renderQuiz()
+  }
   if (viewName === 'settings')  renderSettings()
 }
 
@@ -3368,40 +3377,15 @@ function zoomToD3Node(d) {
 // ══════════════════════════════════════════════════════════════
 // VUE 5 — 復習 QUIZ SRS
 // ══════════════════════════════════════════════════════════════
-// ══════════════════════════════════════════════════════════════
-// VUE 復習 — Pool toggle Kanji / JLPT
-// ══════════════════════════════════════════════════════════════
-let quizPoolMode = 'kanji'
 
-function setQuizPoolMode(mode) {
-  quizPoolMode = mode
-  // Construire la session AVANT renderQuiz pour qu'elle ne voie pas une session vide
-  // et ne réinitialise pas quizPoolMode à 'kanji'
-  quizSession   = getCardsForSession()
-  quizIndex     = 0
-  quizRevealed  = false
-  quizTodayCount = 0
-  renderQuiz()
-}
+let quizPoolMode    = 'kanji'
+let quizRevealed    = false
+let quizTodayCount  = 0
+let quizWaitTimeout = null
 
-function getCardsForSessionJLPT() {
-  const today    = new Date().toISOString().split('T')[0]
-  const newLimit = getDailyNewLimit()
-  const reviews  = MOTS_JLPT
-    .filter(m => (m.srs_state || 0) >= 1 && (!m.srs_next_review || m.srs_next_review <= today))
-    .map(m => ({ ...m, _type: 'jlpt' }))
-  const nouveaux = MOTS_JLPT
-    .filter(m => (m.srs_state || 0) === 0)
-    .slice(0, newLimit)
-    .map(m => ({ ...m, _type: 'jlpt' }))
-  return [...reviews, ...nouveaux]
-}
-
-
+// JLPT mode — file linéaire
 let quizSession = []
-let quizIndex = 0
-let quizRevealed = false
-let quizTodayCount = 0
+let quizIndex   = 0
 
 function getDailyNewLimit() {
   const v = localStorage.getItem('kanjiNiwa_dailyNewLimit')
@@ -3413,72 +3397,188 @@ function getDailyReviewLimit() {
   return v ? parseInt(v, 10) : Infinity
 }
 
-function getCardsForSession() {
-  if (quizPoolMode === 'jlpt') return getCardsForSessionJLPT()
-  const today      = new Date().toISOString().split('T')[0]
-  const dailyLimit = getDailyNewLimit()
+// ── Session kanji ──────────────────────────────────────────────
 
-  const reviews = db.kanji
-    .filter(k => k.srs_state >= 3 && k.srs_next_review <= today)
-    .map(k => ({ ...k, _type: 'kanji', _category: 'review' }))
+function buildSession() {
+  const today = new Date().toISOString().split('T')[0]
 
-  const learning = db.kanji
-    .filter(k => k.srs_state === 1 || k.srs_state === 2)
-    .map(k => ({ ...k, _type: 'kanji', _category: 'learning' }))
-
+  const reviews  = db.kanji.filter(k =>
+    k.srs_state >= 3 && k.srs_next_review && k.srs_next_review <= today
+  )
+  const learning = db.kanji.filter(k =>
+    k.srs_state === 1 || k.srs_state === 2
+  )
   const newCards = db.kanji
     .filter(k => k.srs_state === 0)
-    .slice(0, dailyLimit)
-    .map(k => ({ ...k, _type: 'kanji', _category: 'new' }))
+    .slice(0, getDailyNewLimit())
 
-  return [...reviews, ...learning, ...newCards]
+  window.SESSION = {
+    _date:          today,
+    reviews:        [...reviews],
+    learning:       [...learning],
+    newCards:       [...newCards],
+    learningTimers: {}
+  }
+}
+
+function getNextCard() {
+  if (!window.SESSION) return null
+  const s   = window.SESSION
+  const now = Date.now()
+
+  const dueLearning = s.learning.filter(k =>
+    s.learningTimers[k.id] && s.learningTimers[k.id] <= now
+  )
+  if (dueLearning.length > 0) return dueLearning[0]
+
+  if (s.reviews.length  > 0) return s.reviews[0]
+  if (s.newCards.length > 0) return s.newCards[0]
+
+  const timers = Object.values(s.learningTimers)
+  if (timers.length > 0) {
+    const nextMs = Math.min(...timers)
+    if (nextMs > now) return { _waiting: true, ms: nextMs - now }
+  }
+
+  return null
 }
 
 function getSessionCounts() {
-  const remaining = quizSession.slice(quizIndex)
-  return {
-    bleu:  remaining.filter(c => c._category === 'new').length,
-    rouge: remaining.filter(c => c._category === 'learning').length,
-    vert:  remaining.filter(c => c._category === 'review').length
+  if (quizPoolMode === 'jlpt') {
+    const rem = quizSession.slice(quizIndex)
+    return {
+      bleu:  rem.filter(c => c._category === 'new').length,
+      rouge: rem.filter(c => c._category === 'learning').length,
+      vert:  rem.filter(c => c._category === 'review').length
+    }
   }
+  if (!window.SESSION) return { bleu: 0, rouge: 0, vert: 0 }
+  const s   = window.SESSION
+  const now = Date.now()
+  return {
+    bleu:  s.newCards.length,
+    rouge: s.learning.filter(k => s.learningTimers[k.id] && s.learningTimers[k.id] <= now).length,
+    vert:  s.reviews.length
+  }
+}
+
+// ── Pool toggle ────────────────────────────────────────────────
+
+function setQuizPoolMode(mode) {
+  quizPoolMode   = mode
+  quizRevealed   = false
+  quizTodayCount = 0
+  if (quizWaitTimeout) { clearTimeout(quizWaitTimeout); quizWaitTimeout = null }
+  if (mode === 'kanji') {
+    buildSession()
+  } else {
+    quizSession = getCardsForSessionJLPT()
+    quizIndex   = 0
+  }
+  renderQuiz()
+}
+
+function getCardsForSessionJLPT() {
+  const today    = new Date().toISOString().split('T')[0]
+  const newLimit = getDailyNewLimit()
+  const reviews  = MOTS_JLPT
+    .filter(m => (m.srs_state || 0) >= 1 && (!m.srs_next_review || m.srs_next_review <= today))
+    .map(m => ({ ...m, _type: 'jlpt', _category: 'review' }))
+  const nouveaux = MOTS_JLPT
+    .filter(m => (m.srs_state || 0) === 0)
+    .slice(0, newLimit)
+    .map(m => ({ ...m, _type: 'jlpt', _category: 'new' }))
+  return [...reviews, ...nouveaux]
+}
+
+// ── Render ─────────────────────────────────────────────────────
+
+function buildDotsHtml() {
+  if (quizPoolMode === 'jlpt') {
+    return quizSession.map((_, i) => {
+      let cls = 'quiz-dot'
+      if (i < quizIndex) cls += ' done'
+      if (i === quizIndex) cls += ' current'
+      return `<div class="${cls}"></div>`
+    }).join('')
+  }
+  const c = getSessionCounts()
+  return [
+    ...Array(c.vert).fill('<div class="quiz-dot"></div>'),
+    ...Array(c.rouge).fill('<div class="quiz-dot current"></div>'),
+    ...Array(c.bleu).fill('<div class="quiz-dot"></div>')
+  ].join('')
+}
+
+function renderQuizEmptyState(area) {
+  area.innerHTML = `<div class="quiz-empty" style="text-align:center;padding:2rem 1rem;">
+    <div style="margin-bottom:12px;"><svg width="32" height="32" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="10" cy="10" r="8.5" fill="none" stroke="#B4B2A9" stroke-width="1.5"/><path d="M1.5 10 A8.5 8.5 0 0 1 18.5 10" fill="#E8E4DC"/><path d="M1.5 10 A8.5 8.5 0 0 0 18.5 10" fill="white"/><line x1="1.5" y1="10" x2="18.5" y2="10" stroke="#B4B2A9" stroke-width="1.5"/><circle cx="10" cy="10" r="2.5" fill="white" stroke="#B4B2A9" stroke-width="1.5"/><circle cx="10" cy="10" r="1" fill="#E8E4DC"/></svg></div>
+    <div style="font-size:15px;font-weight:500;color:var(--text);">Tout est à jour pour aujourd'hui</div>
+  </div>`
+}
+
+function renderQuizDone(area) {
+  const s   = window.SESSION
+  const now = Date.now()
+  let waitHtml = ''
+  if (s) {
+    const pending = Object.values(s.learningTimers).filter(t => t > now)
+    if (pending.length > 0) {
+      const nextMs  = Math.min(...pending)
+      const nextMin = Math.ceil((nextMs - now) / 60000)
+      waitHtml = `<p style="color:#888780;font-size:13px;margin-top:8px;">${pending.length} carte${pending.length > 1 ? 's' : ''} dans ${nextMin} min</p>`
+      quizWaitTimeout = setTimeout(() => { quizRevealed = false; renderQuiz() }, nextMs - now)
+    }
+  }
+  area.innerHTML = `
+    <div style="text-align:center;padding:3rem 1rem;">
+      <svg width="48" height="48" viewBox="0 0 48 48" style="opacity:0.5;margin-bottom:16px;display:block;margin-left:auto;margin-right:auto;">
+        <circle cx="24" cy="24" r="22" fill="none" stroke="#E8E4DC" stroke-width="2"/>
+        <line x1="2" y1="24" x2="46" y2="24" stroke="#E8E4DC" stroke-width="2"/>
+        <circle cx="24" cy="24" r="6" fill="none" stroke="#E8E4DC" stroke-width="2"/>
+      </svg>
+      <p style="color:#1A1A18;font-size:18px;margin:0 0 6px;">Session terminée</p>
+      <p style="color:#888780;font-size:14px;margin:0;">今日: ${quizTodayCount} カード完了</p>
+      ${waitHtml}
+    </div>`
+}
+
+function renderQuizWaiting(area, ms) {
+  const min = Math.ceil(ms / 60000)
+  area.innerHTML = `
+    <div style="text-align:center;padding:3rem 1rem;">
+      <p style="color:#888780;font-size:15px;margin:0 0 4px;">Prochain dans ${min} min</p>
+      <p style="color:#B4B2A9;font-size:13px;margin:0;">今日: ${quizTodayCount} カード</p>
+    </div>`
+  quizWaitTimeout = setTimeout(() => { quizRevealed = false; renderQuiz() }, ms)
 }
 
 function renderQuiz() {
   const area = document.getElementById('quiz-area')
-
-  if (quizSession.length === 0) {
-    quizSession = getCardsForSession()
-    quizIndex = 0
-    quizRevealed = false
-    quizTodayCount = 0
-  }
+  if (quizWaitTimeout) { clearTimeout(quizWaitTimeout); quizWaitTimeout = null }
 
   const toggleKanji = document.getElementById('quiz-pool-kanji')
   const toggleJlpt  = document.getElementById('quiz-pool-jlpt')
   if (toggleKanji) toggleKanji.classList.toggle('active', quizPoolMode === 'kanji')
   if (toggleJlpt)  toggleJlpt.classList.toggle('active',  quizPoolMode === 'jlpt')
 
-  if (quizSession.length === 0) {
-    area.innerHTML = `<div class="quiz-empty" style="text-align:center;padding:2rem 1rem;">
-      <div style="margin-bottom:12px;"><svg width="32" height="32" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="10" cy="10" r="8.5" fill="none" stroke="#B4B2A9" stroke-width="1.5"/><path d="M1.5 10 A8.5 8.5 0 0 1 18.5 10" fill="#E8E4DC"/><path d="M1.5 10 A8.5 8.5 0 0 0 18.5 10" fill="white"/><line x1="1.5" y1="10" x2="18.5" y2="10" stroke="#B4B2A9" stroke-width="1.5"/><circle cx="10" cy="10" r="2.5" fill="white" stroke="#B4B2A9" stroke-width="1.5"/><circle cx="10" cy="10" r="1" fill="#E8E4DC"/></svg></div>
-      <div style="font-size:15px;font-weight:500;color:var(--text);">Tout est à jour pour aujourd'hui</div>
-    </div>`
+  // ── JLPT mode ──
+  if (quizPoolMode === 'jlpt') {
+    if (quizSession.length === 0) { renderQuizEmptyState(area); return }
+    if (quizIndex >= quizSession.length) { renderQuizDone(area); return }
+    const card = quizSession[quizIndex]
+    renderQuizJLPTCard(area, card, quizSession.length, buildDotsHtml())
     return
   }
 
-  const total = quizSession.length
-  const card  = quizSession[quizIndex]
+  // ── Kanji mode ──
+  const card = getNextCard()
+  if (!card) { renderQuizDone(area); return }
+  if (card._waiting) { renderQuizWaiting(area, card.ms); return }
 
-  const dotsHtml = quizSession.map((_, i) => {
-    let cls = 'quiz-dot'
-    if (i < quizIndex) cls += ' done'
-    if (i === quizIndex) cls += ' current'
-    return `<div class="${cls}"></div>`
-  }).join('')
-
-  if (card._type === 'jlpt') {
-    renderQuizJLPTCard(area, card, total, dotsHtml)
-  } else if (card._type === 'mot') {
+  const dotsHtml = buildDotsHtml()
+  const total    = (window.SESSION ? window.SESSION.reviews.length + window.SESSION.learning.length + window.SESSION.newCards.length : 0)
+  if (card._type === 'mot') {
     renderQuizMotCard(area, card, total, dotsHtml)
   } else {
     renderQuizKanjiCard(area, card, total, dotsHtml)
@@ -3578,19 +3678,75 @@ function revealQuizCard() {
 }
 
 function quizVerdict(verdict) {
+  quizRevealed = false
+
+  if (quizPoolMode === 'jlpt') {
+    quizVerdictJLPT(verdict)
+    return
+  }
+
+  const card = getNextCard()
+  if (!card || card._waiting) return
+
+  const target = db.kanji.find(k => k.id === card.id)
+  if (!target) { renderQuiz(); return }
+
+  const prevState   = target.srs_state || 0
+  const curInterval = target.srs_interval || 1
+  target.srs_reviews = (target.srs_reviews || 0) + 1
+
+  let minutesUntilNext = 10
+  switch (verdict) {
+    case 'forgot':
+      target.srs_state    = 1
+      target.srs_interval = 1
+      minutesUntilNext    = 1
+      break
+    case 'hard':
+      target.srs_state    = 2
+      target.srs_interval = Math.max(1, Math.round(curInterval * 0.5))
+      minutesUntilNext    = 10
+      break
+    case 'ok': {
+      const next = Math.min(4, prevState + 1)
+      target.srs_state    = next
+      target.srs_interval = SRS_STATES[next].interval
+      minutesUntilNext    = 20
+      break
+    }
+    case 'perfect': {
+      const next = Math.min(4, prevState + 1)
+      target.srs_state    = next
+      target.srs_interval = Math.round(SRS_STATES[next].interval * 1.5)
+      minutesUntilNext    = 20
+      break
+    }
+  }
+  target.srs_next_review = computeNextReview(target.srs_interval)
+  console.log('[SRS]', target.id, '→', target.srs_state, 'next:', target.srs_next_review)
+
+  const s = window.SESSION
+  s.reviews  = s.reviews.filter(k => k.id !== card.id)
+  s.newCards = s.newCards.filter(k => k.id !== card.id)
+  s.learning = s.learning.filter(k => k.id !== card.id)
+  delete s.learningTimers[card.id]
+
+  if (target.srs_state === 1 || target.srs_state === 2) {
+    s.learning.push(target)
+    s.learningTimers[target.id] = Date.now() + minutesUntilNext * 60 * 1000
+  }
+
+  syncSRSToCloud(target.id, 'kanji', target)
+  recordReview()
+  quizTodayCount++
+  renderQuiz()
+}
+
+function quizVerdictJLPT(verdict) {
   const card = quizSession[quizIndex]
   if (!card) return
 
-  let target = null
-  if (card._type === 'jlpt') {
-    target = MOTS_JLPT.find(m => m.japonais === card.japonais)
-  } else if (card._type === 'kanji') {
-    target = db.kanji.find(k => k.id === card.id)
-  } else {
-    const pk = db.kanji.find(k => k.id === card._kanjiId)
-    if (pk && pk.mots && pk.mots[card._motIdx]) target = pk.mots[card._motIdx]
-  }
-
+  const target = MOTS_JLPT.find(m => m.japonais === card.japonais)
   if (target) {
     const cur         = target.srs_state || 0
     const curInterval = target.srs_interval || 1
@@ -3618,25 +3774,16 @@ function quizVerdict(verdict) {
       }
     }
     target.srs_next_review = computeNextReview(target.srs_interval)
-    console.log('[SRS]', card.id || card._kanjiId, '→', target.srs_state, 'next:', target.srs_next_review)
-    if (card._type === 'jlpt') {
-      syncSRSToCloud(target.id, 'jlpt', target)
-      recordReview()
-    } else if (card._type === 'kanji') {
-      syncSRSToCloud(card.id, 'kanji', target)
-      recordReview()
-    } else {
-      syncSRSToCloud(card._kanjiId + ':' + card._motIdx, 'mot', target)
-      recordReview()
-    }
+    console.log('[SRS]', target.id, '→', target.srs_state, 'next:', target.srs_next_review)
+    syncSRSToCloud(target.id, 'jlpt', target)
+    recordReview()
   }
 
   quizTodayCount++
   quizIndex++
-  quizRevealed = false
   if (quizIndex >= quizSession.length) {
     quizSession = []
-    quizIndex = 0
+    quizIndex   = 0
   }
   renderQuiz()
 }
