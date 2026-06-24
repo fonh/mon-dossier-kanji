@@ -2432,16 +2432,7 @@ function showView(viewName) {
   if (viewName === 'kanji')     { if (kanjiViewMode === 'jlpt') renderJLPTGrid(); else { renderKanjiGrid(); populateRadicalFilter() } }
   if (viewName === 'bushu')     { renderBushu(); renderD3Graph() }
   if (viewName === 'goi')       { renderVocab(); populateVocabKanjiFilter() }
-  if (viewName === 'fukushuu')  {
-    quizPoolMode = 'kanji'
-    const today = new Date().toISOString().split('T')[0]
-    if (!window.SESSION || window.SESSION._date !== today) {
-      quizTodayCount  = 0
-      quizRevealed    = false
-      buildSession()
-    }
-    renderQuiz()
-  }
+  if (viewName === 'fukushuu')  { quizPoolMode = 'kanji'; buildSession(); renderQuiz() }
   if (viewName === 'settings')  renderSettings()
 }
 
@@ -3378,10 +3369,9 @@ function zoomToD3Node(d) {
 // VUE 5 — 復習 QUIZ SRS
 // ══════════════════════════════════════════════════════════════
 
-let quizPoolMode    = 'kanji'
-let quizRevealed    = false
-let quizTodayCount  = 0
-let quizWaitTimeout = null
+let quizPoolMode   = 'kanji'
+let quizRevealed   = false
+let quizTodayCount = 0
 
 // JLPT mode — file linéaire
 let quizSession = []
@@ -3397,50 +3387,32 @@ function getDailyReviewLimit() {
   return v ? parseInt(v, 10) : Infinity
 }
 
-// ── Session kanji ──────────────────────────────────────────────
+// ── Session kanji — file unique ────────────────────────────────
 
 function buildSession() {
   const today = new Date().toISOString().split('T')[0]
+  if (window.SESSION?._date === today) return
+
+  quizTodayCount = 0
+  quizRevealed   = false
 
   const reviews  = db.kanji.filter(k =>
     k.srs_state >= 3 && k.srs_next_review && k.srs_next_review <= today
-  )
-  const learning = db.kanji.filter(k =>
-    k.srs_state === 1 || k.srs_state === 2
   )
   const newCards = db.kanji
     .filter(k => k.srs_state === 0)
     .slice(0, getDailyNewLimit())
 
   window.SESSION = {
-    _date:          today,
-    reviews:        [...reviews],
-    learning:       [...learning],
-    newCards:       [...newCards],
-    learningTimers: {}
+    _date:       today,
+    queue:       [...reviews, ...newCards],
+    reshowCount: {}
   }
 }
 
 function getNextCard() {
-  if (!window.SESSION) return null
-  const s   = window.SESSION
-  const now = Date.now()
-
-  const dueLearning = s.learning.filter(k =>
-    s.learningTimers[k.id] && s.learningTimers[k.id] <= now
-  )
-  if (dueLearning.length > 0) return dueLearning[0]
-
-  if (s.reviews.length  > 0) return s.reviews[0]
-  if (s.newCards.length > 0) return s.newCards[0]
-
-  const timers = Object.values(s.learningTimers)
-  if (timers.length > 0) {
-    const nextMs = Math.min(...timers)
-    if (nextMs > now) return { _waiting: true, ms: nextMs - now }
-  }
-
-  return null
+  if (!window.SESSION?.queue?.length) return null
+  return window.SESSION.queue[0]
 }
 
 function getSessionCounts() {
@@ -3452,13 +3424,11 @@ function getSessionCounts() {
       vert:  rem.filter(c => c._category === 'review').length
     }
   }
-  if (!window.SESSION) return { bleu: 0, rouge: 0, vert: 0 }
-  const s   = window.SESSION
-  const now = Date.now()
+  const queue = window.SESSION?.queue || []
   return {
-    bleu:  s.newCards.length,
-    rouge: s.learning.filter(k => s.learningTimers[k.id] && s.learningTimers[k.id] <= now).length,
-    vert:  s.reviews.length
+    bleu:  queue.filter(k => (k.srs_state || 0) === 0).length,
+    rouge: queue.filter(k => { const s = k.srs_state || 0; return s === 1 || s === 2 }).length,
+    vert:  queue.filter(k => (k.srs_state || 0) >= 3).length
   }
 }
 
@@ -3468,8 +3438,8 @@ function setQuizPoolMode(mode) {
   quizPoolMode   = mode
   quizRevealed   = false
   quizTodayCount = 0
-  if (quizWaitTimeout) { clearTimeout(quizWaitTimeout); quizWaitTimeout = null }
   if (mode === 'kanji') {
+    window.SESSION = null
     buildSession()
   } else {
     quizSession = getCardsForSessionJLPT()
@@ -3518,18 +3488,6 @@ function renderQuizEmptyState(area) {
 }
 
 function renderQuizDone(area) {
-  const s   = window.SESSION
-  const now = Date.now()
-  let waitHtml = ''
-  if (s) {
-    const pending = Object.values(s.learningTimers).filter(t => t > now)
-    if (pending.length > 0) {
-      const nextMs  = Math.min(...pending)
-      const nextMin = Math.ceil((nextMs - now) / 60000)
-      waitHtml = `<p style="color:#888780;font-size:13px;margin-top:8px;">${pending.length} carte${pending.length > 1 ? 's' : ''} dans ${nextMin} min</p>`
-      quizWaitTimeout = setTimeout(() => { quizRevealed = false; renderQuiz() }, nextMs - now)
-    }
-  }
   area.innerHTML = `
     <div style="text-align:center;padding:3rem 1rem;">
       <svg width="48" height="48" viewBox="0 0 48 48" style="opacity:0.5;margin-bottom:16px;display:block;margin-left:auto;margin-right:auto;">
@@ -3538,24 +3496,13 @@ function renderQuizDone(area) {
         <circle cx="24" cy="24" r="6" fill="none" stroke="#E8E4DC" stroke-width="2"/>
       </svg>
       <p style="color:#1A1A18;font-size:18px;margin:0 0 6px;">Session terminée</p>
-      <p style="color:#888780;font-size:14px;margin:0;">今日: ${quizTodayCount} カード完了</p>
-      ${waitHtml}
+      <p style="color:#888780;font-size:14px;margin:0;">Reviens demain pour tes révisions</p>
+      <p style="color:#B4B2A9;font-size:13px;margin-top:8px;">今日: ${quizTodayCount} カード完了</p>
     </div>`
-}
-
-function renderQuizWaiting(area, ms) {
-  const min = Math.ceil(ms / 60000)
-  area.innerHTML = `
-    <div style="text-align:center;padding:3rem 1rem;">
-      <p style="color:#888780;font-size:15px;margin:0 0 4px;">Prochain dans ${min} min</p>
-      <p style="color:#B4B2A9;font-size:13px;margin:0;">今日: ${quizTodayCount} カード</p>
-    </div>`
-  quizWaitTimeout = setTimeout(() => { quizRevealed = false; renderQuiz() }, ms)
 }
 
 function renderQuiz() {
   const area = document.getElementById('quiz-area')
-  if (quizWaitTimeout) { clearTimeout(quizWaitTimeout); quizWaitTimeout = null }
 
   const toggleKanji = document.getElementById('quiz-pool-kanji')
   const toggleJlpt  = document.getElementById('quiz-pool-jlpt')
@@ -3574,10 +3521,9 @@ function renderQuiz() {
   // ── Kanji mode ──
   const card = getNextCard()
   if (!card) { renderQuizDone(area); return }
-  if (card._waiting) { renderQuizWaiting(area, card.ms); return }
 
   const dotsHtml = buildDotsHtml()
-  const total    = (window.SESSION ? window.SESSION.reviews.length + window.SESSION.learning.length + window.SESSION.newCards.length : 0)
+  const total    = window.SESSION?.queue?.length || 0
   if (card._type === 'mot') {
     renderQuizMotCard(area, card, total, dotsHtml)
   } else {
@@ -3685,8 +3631,10 @@ function quizVerdict(verdict) {
     return
   }
 
-  const card = getNextCard()
-  if (!card || card._waiting) return
+  const s = window.SESSION
+  if (!s?.queue?.length) return
+
+  const card = s.queue.shift()
 
   const target = db.kanji.find(k => k.id === card.id)
   if (!target) { renderQuiz(); return }
@@ -3695,45 +3643,37 @@ function quizVerdict(verdict) {
   const curInterval = target.srs_interval || 1
   target.srs_reviews = (target.srs_reviews || 0) + 1
 
-  let minutesUntilNext = 10
   switch (verdict) {
     case 'forgot':
       target.srs_state    = 1
       target.srs_interval = 1
-      minutesUntilNext    = 1
       break
     case 'hard':
       target.srs_state    = 2
       target.srs_interval = Math.max(1, Math.round(curInterval * 0.5))
-      minutesUntilNext    = 10
       break
     case 'ok': {
       const next = Math.min(4, prevState + 1)
       target.srs_state    = next
       target.srs_interval = SRS_STATES[next].interval
-      minutesUntilNext    = 20
       break
     }
     case 'perfect': {
       const next = Math.min(4, prevState + 1)
       target.srs_state    = next
       target.srs_interval = Math.round(SRS_STATES[next].interval * 1.5)
-      minutesUntilNext    = 20
       break
     }
   }
   target.srs_next_review = computeNextReview(target.srs_interval)
   console.log('[SRS]', target.id, '→', target.srs_state, 'next:', target.srs_next_review)
 
-  const s = window.SESSION
-  s.reviews  = s.reviews.filter(k => k.id !== card.id)
-  s.newCards = s.newCards.filter(k => k.id !== card.id)
-  s.learning = s.learning.filter(k => k.id !== card.id)
-  delete s.learningTimers[card.id]
-
   if (target.srs_state === 1 || target.srs_state === 2) {
-    s.learning.push(target)
-    s.learningTimers[target.id] = Date.now() + minutesUntilNext * 60 * 1000
+    const count = s.reshowCount[card.id] || 0
+    if (count < 3) {
+      s.reshowCount[card.id] = count + 1
+      s.queue.push(target)
+    }
   }
 
   syncSRSToCloud(target.id, 'kanji', target)
